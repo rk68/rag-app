@@ -24,6 +24,7 @@ logging.basicConfig(level=logging.INFO)
 # Load environment variables from .env file
 load_dotenv()
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Fetch API keys from environment variables
 pinecone_api_key = os.getenv('PINECONE_API_KEY')
 parse_api_key = os.getenv('PARSE_API_KEY')
@@ -41,15 +42,33 @@ def log_and_exit(message):
     logging.error(message)
     raise SystemExit(message)
 
-def initialize_apis():
+def initialize_apis(api, model):
     global llm, pinecone_index
     try:
         if llm is None:
-            llm = ChatGroq(model="mixtral-8x7b-32768", temperature=0)
+            if api == 'groq':
+                if model == 'mixtral-8x7b':
+                    llm = ChatGroq(model="mixtral-8x7b-32768", temperature=0)
+                elif model == 'llama3-8b':
+                    llm = ChatGroq(model="llama3-8b-8192", temperature=0)
+                elif model == "llama3-70b": 
+                    llm = ChatGroq(model="llama3-70b-8192", temperature=0)
+                elif model == "gemma-7b":
+                    llm = ChatGroq(model="gemma-7b-it", temperature=0)
+
+            elif api == 'azure':
+                if model == 'gpt35':
+                    llm = AzureOpenAI(
+                        deployment_name="gpt35",
+                        temperature=0,
+                        api_key=azure_api_key,
+                        azure_endpoint=azure_endpoint,
+                        api_version=azure_api_version
+                    )
         if pinecone_index is None:
             pinecone_client = Pinecone(pinecone_api_key)
             pinecone_index = pinecone_client.Index("demo")
-        logging.info("Initialized Gemini and Pinecone.")
+        logging.info("Initialized LLM and Pinecone.")
     except Exception as e:
         log_and_exit(f"Error initializing APIs: {e}")
 
@@ -64,10 +83,16 @@ def load_pdf_data():
     except Exception as e:
         log_and_exit(f"Error loading PDF file: {e}")
 
-def create_index(documents):
+def create_index(documents, embedding_model_type="HF", embedding_model="BAAI/bge-large-en-v1.5"):
     global llm, pinecone_index
     try:
-        embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-large-en-v1.5")
+        if embedding_model_type == "HF": 
+            embed_model = HuggingFaceEmbedding(model_name=embedding_model)
+
+        elif embedding_model_type == "OAI":
+            #embed_model = OpenAIEmbedding() implement oai EMBEDDING
+            pass
+
         Settings.llm = llm
         Settings.embed_model = embed_model
         Settings.chunk_size = 512
@@ -115,14 +140,14 @@ def process_csv(input_csv_path, output_csv_path, query_engine):
     df.to_csv(output_csv_path, index=False)
     print(f"Output saved to {output_csv_path}")
 
-def run_streamlit_app():
+def run_streamlit_app(api, model):
     import streamlit as st
 
     global query_engine
 
     # Lazy load the query engine
     if query_engine is None:
-        initialize_apis()
+        initialize_apis(api, model)
         documents = load_pdf_data()
         index = create_index(documents)
         query_engine = setup_query_engine(index)
@@ -146,12 +171,12 @@ def run_streamlit_app():
         st.session_state.chat_history.append({'user': question, 'response': response})
         st.experimental_rerun()  # Refresh the UI to display the new chat entry
 
-def run_terminal_app():
+def run_terminal_app(api, model):
     global query_engine
 
     # Lazy load the query engine
     if query_engine is None:
-        initialize_apis()
+        initialize_apis(api ,model)
         documents = load_pdf_data()
         index = create_index(documents)
         query_engine = setup_query_engine(index)
@@ -164,12 +189,22 @@ def run_terminal_app():
         print("Response:", response)
 
 def main():
-    # Check if running with Streamlit
-    try:
-        import streamlit as st
-        run_streamlit_app()
-    except ImportError:
-        run_terminal_app()
+    parser = argparse.ArgumentParser(description="Run the RAG app.")
+    parser.add_argument('--mode', type=str, choices=['streamlit', 'terminal'], required=False, default='terminal', help="Mode to run the application in: 'streamlit' or 'terminal'")
+    parser.add_argument('--api', type=str, choices=['azure', 'ollama', 'groq'], required=False, default='groq', help='Which api to use to call LLMs: ollama, groq or azure (openai)')
+    parser.add_argument('--model', type=str, choices=['llama3-8b', 'llama3-70b' 'mixtral-8x7b', 'gemma-7b',  'gpt35'])
+    parser.add_argument('--embedding_model_type', type=str,choices=['HF'], required=False, default="HF")
+    parser.add_argument('--embedding_model', type=str, default="BAAI/bge-large-en-v1.5")
+    args = parser.parse_args()
+
+    if args.mode == 'streamlit':
+        try:
+            import streamlit as st
+            run_streamlit_app(args.api, args.model)
+        except ImportError:
+            log_and_exit("Streamlit is not installed. Please install it to run the Streamlit app.")
+    elif args.mode == 'terminal':
+        run_terminal_app(args.api, args.model)
 
 if __name__ == "__main__":
     main()
