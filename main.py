@@ -65,6 +65,7 @@ def initialize_apis(api, model):
                         azure_endpoint=azure_endpoint,
                         api_version=azure_api_version
                     )
+
         if pinecone_index is None:
             pinecone_client = Pinecone(pinecone_api_key)
             pinecone_index = pinecone_client.Index("demo")
@@ -114,31 +115,8 @@ def setup_query_engine(index):
     except Exception as e:
         log_and_exit(f"Error setting up query engine: {e}")
 
-def process_csv(input_csv_path, output_csv_path, query_engine):
-    df = pd.read_csv(input_csv_path)
-    responses = []
 
-    for _, row in df.iterrows():
-        question = row['question']
-        try:
-            response = query_engine.query(question)
-            responses.append(response)
-        except Exception as e:
-            responses.append("Error: " + str(e))
 
-    df['response'] = responses
-
-    vectorizer = TfidfVectorizer().fit_transform(df[['ideal_answer', 'response']].values.flatten())
-    vectors = vectorizer.toarray()
-    cosine_similarities = []
-
-    for i in range(0, len(vectors), 2):
-        cos_sim = cosine_similarity([vectors[i]], [vectors[i + 1]])[0][0]
-        cosine_similarities.append(cos_sim)
-
-    df['cosine_similarity'] = cosine_similarities
-    df.to_csv(output_csv_path, index=False)
-    print(f"Output saved to {output_csv_path}")
 
 def run_streamlit_app(api, model):
     import streamlit as st
@@ -190,7 +168,7 @@ def run_terminal_app(api, model):
 
 def main():
     parser = argparse.ArgumentParser(description="Run the RAG app.")
-    parser.add_argument('--mode', type=str, choices=['streamlit', 'terminal'], required=False, default='terminal', help="Mode to run the application in: 'streamlit' or 'terminal'")
+    parser.add_argument('--mode', type=str, choices=['streamlit', 'terminal', 'benchmark'], required=False, default='terminal', help="Mode to run the application in: 'streamlit' or 'terminal' or 'benchmark")
     parser.add_argument('--api', type=str, choices=['azure', 'ollama', 'groq'], required=False, default='groq', help='Which api to use to call LLMs: ollama, groq or azure (openai)')
     parser.add_argument('--model', type=str, choices=['llama3-8b', 'llama3-70b' 'mixtral-8x7b', 'gemma-7b',  'gpt35'])
     parser.add_argument('--embedding_model_type', type=str,choices=['HF'], required=False, default="HF")
@@ -205,6 +183,8 @@ def main():
             log_and_exit("Streamlit is not installed. Please install it to run the Streamlit app.")
     elif args.mode == 'terminal':
         run_terminal_app(args.api, args.model)
+    elif args.mode == 'benchmark':
+
 
 if __name__ == "__main__":
     main()
