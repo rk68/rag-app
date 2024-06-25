@@ -218,6 +218,8 @@ def retrieve_answers_for_modes(api, model, file_path):
     df.to_csv(file_path, index=False)
     logging.info(f"Processed questions and updated the CSV file with answers: {file_path}")
 
+
+
 def run_streamlit_app(api, model):
     global query_engine
 
@@ -325,7 +327,7 @@ def main():
 
 if __name__ == "__main__":
     import sys
-    if 'streamlit' in sys.argv[0]:
-        run_streamlit_app('azure', 'gpt35')
-    else:
-        main()
+    #if 'streamlit' in sys.argv[0]:
+    run_streamlit_app('azure', 'gpt35')
+    #else:
+    #    main()
