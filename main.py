@@ -6,48 +6,50 @@ import streamlit as st
 from pinecone import Pinecone
 from llama_index.llms.gemini import Gemini
 from llama_index.vector_stores.pinecone import PineconeVectorStore
-from llama_index.core import StorageContext, VectorStoreIndex, SimpleDirectoryReader, get_response_synthesizer
-from llama_index.core import Settings
+from llama_index.core import (
+    StorageContext, VectorStoreIndex, SimpleDirectoryReader, 
+    get_response_synthesizer, Settings
+)
 from dotenv import load_dotenv
 from llama_index.core.node_parser import SentenceSplitter
 from llama_parse import LlamaParse
-from llama_index.core.retrievers import VectorIndexRetriever
-from llama_index.core.retrievers import RouterRetriever
+from llama_index.core.retrievers import (
+    VectorIndexRetriever, RouterRetriever
+)
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.tools import RetrieverTool
-from llama_index.core.query_engine import RetrieverQueryEngine
-from langchain_groq import ChatGroq
+from llama_index.core.query_engine import (
+    RetrieverQueryEngine, FLAREInstructQueryEngine, MultiStepQueryEngine
+)
+from llama_index.core.indices.query.query_transform import (
+    HyDEQueryTransform, StepDecomposeQueryTransform
+)
+from llama_index.llms.groq import Groq
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.azure_openai import AzureOpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-from llama_index.core.query_engine import FLAREInstructQueryEngine, MultiStepQueryEngine
-from llama_index.core.indices.query.query_transform import HyDEQueryTransform
-from llama_index.core.query_engine import TransformQueryEngine
-from llama_index.core.indices.query.query_transform.base import (
-    StepDecomposeQueryTransform,
-)
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
 # Load environment variables from .env file
 load_dotenv()
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # Fetch API keys from environment variables
-pinecone_api_key = os.getenv('PINECONE_API_KEY')
-parse_api_key = os.getenv('PARSE_API_KEY')
-azure_api_key = os.getenv('AZURE_API_KEY')
-azure_endpoint = os.getenv('AZURE_ENDPOINT')
-azure_deployment_name = os.getenv('AZURE_DEPLOYMENT_NAME')
-azure_api_version = os.getenv('AZURE_API_VERSION')
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
+PARSE_API_KEY = os.getenv('PARSE_API_KEY')
+AZURE_API_KEY = os.getenv('AZURE_API_KEY')
+AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT')
+AZURE_DEPLOYMENT_NAME = os.getenv('AZURE_DEPLOYMENT_NAME')
+AZURE_API_VERSION = os.getenv('AZURE_API_VERSION')
 
 # Global variables for lazy loading
 llm = None
 pinecone_index = None
-query_engine = None
 
 def log_and_exit(message):
     logging.error(message)
@@ -57,38 +59,37 @@ def initialize_apis(api, model):
     global llm, pinecone_index
     try:
         if llm is None:
-            if api == 'groq':
-                if model == 'mixtral-8x7b':
-                    llm = ChatGroq(model="mixtral-8x7b-32768", temperature=0)
-                elif model == 'llama3-8b':
-                    llm = ChatGroq(model="llama3-8b-8192", temperature=0)
-                elif model == "llama3-70b":
-                    llm = ChatGroq(model="llama3-70b-8192", temperature=0)
-                elif model == "gemma-7b":
-                    llm = ChatGroq(model="gemma-7b-it", temperature=0)
-
-            elif api == 'azure':
-                if model == 'gpt35':
-                    llm = AzureOpenAI(
-                        deployment_name="gpt35",
-                        temperature=0,
-                        api_key=azure_api_key,
-                        azure_endpoint=azure_endpoint,
-                        api_version=azure_api_version
-                    )
-                    
+            llm = initialize_llm(api, model)
         if pinecone_index is None:
-            index_name = "demo"
-            pinecone_client = Pinecone(pinecone_api_key)
-            pinecone_index = pinecone_client.Index(index_name)
+            pinecone_client = Pinecone(PINECONE_API_KEY)
+            pinecone_index = pinecone_client.Index("demo")
         logging.info("Initialized LLM and Pinecone.")
     except Exception as e:
         log_and_exit(f"Error initializing APIs: {e}")
 
+def initialize_llm(api, model):
+    if api == 'groq':
+        model_mappings = {
+            'mixtral-8x7b': "mixtral-8x7b-32768",
+            'llama3-8b': "llama3-8b-8192",
+            'llama3-70b': "llama3-70b-8192",
+            'gemma-7b': "gemma-7b-it"
+        }
+        return Groq(model=model_mappings[model], api_key=os.getenv("GROQ_API_KEY"))
+    elif api == 'azure':
+        if model == 'gpt35':
+            return AzureOpenAI(
+                deployment_name=AZURE_DEPLOYMENT_NAME,
+                temperature=0,
+                api_key=AZURE_API_KEY,
+                azure_endpoint=AZURE_ENDPOINT,
+                api_version=AZURE_API_VERSION
+            )
+
 def load_pdf_data():
     PDF_FILE_PATH = "policy.pdf"
     try:
-        parser = LlamaParse(api_key=parse_api_key, result_type="markdown")
+        parser = LlamaParse(api_key=PARSE_API_KEY, result_type="markdown")
         file_extractor = {".pdf": parser}
         documents = SimpleDirectoryReader(input_files=[PDF_FILE_PATH], file_extractor=file_extractor).load_data()
         logging.info(f"Loaded {len(documents)} documents from PDF.")
@@ -99,58 +100,50 @@ def load_pdf_data():
 def create_index(documents, embedding_model_type="HF", embedding_model="BAAI/bge-large-en-v1.5", retriever_method="BM25"):
     global llm, pinecone_index
     try:
-        if embedding_model_type == "HF":
-            embed_model = HuggingFaceEmbedding(model_name=embedding_model)
-        elif embedding_model_type == "OAI":
-            # embed_model = OpenAIEmbedding() implement oai EMBEDDING
-            pass
+        embed_model = select_embedding_model(embedding_model_type, embedding_model)
 
         Settings.llm = llm
         Settings.embed_model = embed_model
         Settings.chunk_size = 512
 
-        if retriever_method == "BM25" or retriever_method == "BM25+Vector":
-            splitter = SentenceSplitter(chunk_size=512)
-            nodes = splitter.get_nodes_from_documents(documents)
-            storage_context = StorageContext.from_defaults()
-            return None, nodes  # Return None for index when using BM25
+        if retriever_method in ["BM25", "BM25+Vector"]:
+            nodes = create_bm25_nodes(documents)
+            logging.info("Created BM25 nodes from documents.")
+            if retriever_method == "BM25+Vector":
+                vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
+                storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+                logging.info("Created index for BM25+Vector from documents.")
+                return index, nodes
+            return None, nodes
         else:
             vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
             index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
             logging.info("Created index from documents.")
-            return index, None  # Return None for nodes when not using BM25
+            return index, None
     except Exception as e:
         log_and_exit(f"Error creating index: {e}")
+
+def select_embedding_model(embedding_model_type, embedding_model):
+    if embedding_model_type == "HF":
+        return HuggingFaceEmbedding(model_name=embedding_model)
+    elif embedding_model_type == "OAI":
+        return OpenAIEmbedding()  # Implement OAI Embedding if needed
+
+def create_bm25_nodes(documents):
+    splitter = SentenceSplitter(chunk_size=512)
+    nodes = splitter.get_nodes_from_documents(documents)
+    return nodes
 
 def setup_query_engine(index, response_mode, nodes=None, query_engine_method=None, retriever_method=None):
     global llm
     try:
         logging.info(f"Setting up query engine with retriever_method: {retriever_method} and query_engine_method: {query_engine_method}")
-
-        if retriever_method == 'BM25':
-            retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=2)
-        elif retriever_method == "BM25+Vector":
-            vector_retriever = VectorIndexRetriever(index=index)
-            bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=2)
-
-            retriever_tools = [
-                RetrieverTool.from_defaults(
-                    retriever=vector_retriever,
-                    description='Useful in most cases',
-                ),
-                RetrieverTool.from_defaults(
-                    retriever=bm25_retriever,
-                    description='Useful if searching about specific information',
-                ),                 
-            ]
-            retriever = RouterRetriever.from_defaults(
-                retriever_tools=retriever_tools,
-                llm=llm,
-                select_multi=True
-            )
-        else:
-            retriever = VectorIndexRetriever(index=index, similarity_top_k=2)
+        retriever = select_retriever(index, nodes, retriever_method)
+        
+        if retriever is None:
+            log_and_exit("Failed to create retriever. Index or nodes might be None.")
 
         response_synthesizer = get_response_synthesizer(response_mode=response_mode)
         index_query_engine = index.as_query_engine(similarity_top_k=2) if index else None
@@ -158,22 +151,59 @@ def setup_query_engine(index, response_mode, nodes=None, query_engine_method=Non
         if query_engine_method == "FLARE":
             query_engine = FLAREInstructQueryEngine(
                 query_engine=index_query_engine,
-                max_iterations=7,
-                verbose=True
+                max_iterations=4,
+                verbose=False
             )
         elif query_engine_method == "MS":
-            step_decompose_transform = StepDecomposeQueryTransform(llm=llm, verbose=True)
-            index_summary = "Used to answer questions about the regulation"
             query_engine = MultiStepQueryEngine(
                 query_engine=index_query_engine,
-                query_transform=step_decompose_transform,
-                index_summary=index_summary
+                query_transform=StepDecomposeQueryTransform(llm=llm, verbose=False),
+                index_summary="Used to answer questions about the regulation"
             )
         else:
             query_engine = RetrieverQueryEngine(retriever=retriever, response_synthesizer=response_synthesizer)
+        
+        if query_engine is None:
+            log_and_exit("Failed to create query engine.")
+        
         return query_engine
     except Exception as e:
+        logging.error(f"Error setting up query engine: {e}")
+        traceback.print_exc()
         log_and_exit(f"Error setting up query engine: {e}")
+
+def select_retriever(index, nodes, retriever_method):
+    logging.info(f"Selecting retriever with method: {retriever_method}")
+    if nodes is not None:
+        logging.info(f"Available document IDs: {list(range(len(nodes)))}")
+    else:
+        logging.warning("Nodes are None")
+    
+    if retriever_method == 'BM25':
+        return BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=2)
+    elif retriever_method == "BM25+Vector":
+        if index is None:
+            log_and_exit("Index must be initialized when using BM25+Vector retriever method.")
+        return RouterRetriever.from_defaults(
+            retriever_tools=[
+                RetrieverTool.from_defaults(
+                    retriever=VectorIndexRetriever(index=index),
+                    description='Useful in most cases',
+                ),
+                RetrieverTool.from_defaults(
+                    retriever=BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=2),
+                    description='Useful if searching about specific information',
+                ),
+            ],
+            llm=llm,
+            select_multi=True
+        )
+    elif retriever_method == "Vector Search":
+        if index is None:
+            log_and_exit("Index must be initialized when using Vector Search retriever method.")
+        return VectorIndexRetriever(index=index, similarity_top_k=2)
+    else:
+        log_and_exit(f"Unsupported retriever method: {retriever_method}")
 
 def retrieve_and_update_contexts(api, model, file_path):
     global query_engine
@@ -210,7 +240,7 @@ def retrieve_answers_for_modes(api, model, file_path):
     for idx, row in df.iterrows():
         question = row['question']
         for mode in response_modes:
-            query_engine = setup_query_engine(index, response_mode=mode, retriever_method='Default')
+            query_engine = setup_query_engine(index, response_mode=mode, retriever_method='Vector Search')
             response = query_engine.query(question)
             answer_column = f"{mode}_answer"
             df.at[idx, answer_column] = response.response
@@ -218,44 +248,28 @@ def retrieve_answers_for_modes(api, model, file_path):
     df.to_csv(file_path, index=False)
     logging.info(f"Processed questions and updated the CSV file with answers: {file_path}")
 
-
-
 def run_streamlit_app(api, model):
-    global query_engine
-
-    if query_engine is None:
-        initialize_apis(api, model)
-        documents = load_pdf_data()
-        index, nodes = create_index(documents)
-        query_engine = setup_query_engine(index, response_mode="tree_summarize", nodes=nodes, retriever_method='BM25')
-
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
+    if 'query_engine' not in st.session_state:
+        st.session_state.query_engine = None
 
     st.title("RAG Chat Application")
 
-    query_method = st.selectbox("Select Query Engine Method", ["Default", "FLARE", "MS"])
-    retriever_method = st.selectbox("Select Retriever Method", ["Default", "BM25", "BM25+Vector"])
     selected_api = st.selectbox("Select API", ["azure", "ollama", "groq"])
     selected_model = st.selectbox("Select Model", ["llama3-8b", "llama3-70b", "mixtral-8x7b", "gemma-7b", "gpt35"])
     embedding_model_type = st.selectbox("Select Embedding Model Type", ["HF", "OAI"])
-    embedding_model = st.selectbox("Select Embedding Model", ["BAAI/bge-large-en-v1.5", "other_model"])  # Add your embedding models here
+    embedding_model = st.selectbox("Select Embedding Model", ["BAAI/bge-large-en-v1.5", "other_model"])
+    retriever_method = st.selectbox("Select Retriever Method", ["Vector Search", "BM25", "BM25+Vector"])
+    #query_method = st.selectbox("Select Query Engine Method", ["Default", "FLARE", "MS"])
+    query_method = None # Change this when its ready
+    if st.button("Initialize"):
+        initialize_apis(selected_api, selected_model)
+        documents = load_pdf_data()
+        index, nodes = create_index(documents, embedding_model_type=embedding_model_type, embedding_model=embedding_model, retriever_method=retriever_method)
+        st.session_state.query_engine = setup_query_engine(index, response_mode="tree_summarize", nodes=nodes, query_engine_method=query_method, retriever_method=retriever_method)
+        st.success("Initialization complete.")
 
-    if query_method == "FLARE":
-        if retriever_method in ["BM25", "BM25+Vector"]:
-            query_engine = setup_query_engine(None, response_mode="tree_summarize", nodes=nodes, query_engine_method="FLARE", retriever_method=retriever_method)
-        else:
-            query_engine = setup_query_engine(index, response_mode="tree_summarize", query_engine_method="FLARE", retriever_method=retriever_method)
-    elif query_method == "MS":
-        if retriever_method in ["BM25", "BM25+Vector"]:
-            query_engine = setup_query_engine(None, response_mode="tree_summarize", nodes=nodes, query_engine_method="MS", retriever_method=retriever_method)
-        else:
-            query_engine = setup_query_engine(index, response_mode="tree_summarize", query_engine_method="MS", retriever_method=retriever_method)
-    else:
-        if retriever_method in ["BM25", "BM25+Vector"]:
-            query_engine = setup_query_engine(None, response_mode="tree_summarize", nodes=nodes, retriever_method=retriever_method)
-        else:
-            query_engine = setup_query_engine(index, response_mode="tree_summarize", retriever_method=retriever_method)
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
 
     for chat in st.session_state.chat_history:
         with st.chat_message("user"):
@@ -264,9 +278,23 @@ def run_streamlit_app(api, model):
             st.markdown(chat['response'])
 
     if question := st.chat_input("Enter your question"):
-        response = query_engine.query(question)
-        st.session_state.chat_history.append({'user': question, 'response': response.response})
-        st.rerun()
+        if st.session_state.query_engine:
+            with st.spinner('Generating response...'):
+                response = st.session_state.query_engine.query(question)
+            st.session_state.chat_history.append({'user': question, 'response': response.response})
+            st.rerun()
+        else:
+            st.error("Query engine is not initialized. Please initialize it first.")
+
+def configure_query_engine(index, nodes, query_method, retriever_method):
+    global query_engine
+
+    if query_method == "FLARE":
+        query_engine = setup_query_engine(None if retriever_method in ["BM25", "BM25+Vector"] else index, response_mode="tree_summarize", nodes=nodes, query_engine_method="FLARE", retriever_method=retriever_method)
+    elif query_method == "MS":
+        query_engine = setup_query_engine(None if retriever_method in ["BM25", "BM25+Vector"] else index, response_mode="tree_summarize", nodes=nodes, query_engine_method="MS", retriever_method=retriever_method)
+    else:
+        query_engine = setup_query_engine(None if retriever_method in ["BM25", "BM25+Vector"] else index, response_mode="tree_summarize", nodes=nodes, retriever_method=retriever_method)
 
 def run_terminal_app(api, model, query_method, retriever_method):
     global query_engine
@@ -274,9 +302,9 @@ def run_terminal_app(api, model, query_method, retriever_method):
     if query_engine is None:
         initialize_apis(api, model)
         documents = load_pdf_data()
-        if retriever_method == "BM25" or retriever_method == "BM25+Vector":
-            _, nodes = create_index(documents, retriever_method=retriever_method)
-            query_engine = setup_query_engine(None, response_mode="compact_accumulate", nodes=nodes, query_engine_method=query_method, retriever_method=retriever_method)
+        if retriever_method in ["BM25", "BM25+Vector"]:
+            index, nodes = create_index(documents, retriever_method=retriever_method)
+            query_engine = setup_query_engine(index, response_mode="compact_accumulate", nodes=nodes, query_engine_method=query_method, retriever_method=retriever_method)
         else:
             index, _ = create_index(documents, retriever_method=retriever_method)
             query_engine = setup_query_engine(index, response_mode="compact_accumulate", query_engine_method=query_method, retriever_method=retriever_method)
@@ -286,17 +314,20 @@ def run_terminal_app(api, model, query_method, retriever_method):
         if question.lower() == 'exit':
             break
         response = query_engine.query(question)
-        retrieved_nodes = response.source_nodes
-        chunks = [node.text for node in retrieved_nodes]
-        print("Contexts:")
-        for chunk in chunks:
-            print(chunk)
-        if retriever_method == "BM25" or retriever_method == "BM25+Vector":
-            query_engine = setup_query_engine(None, response_mode="tree_summarize", nodes=nodes, query_engine_method=query_method, retriever_method=retriever_method)
-        else:
-            query_engine = setup_query_engine(index, response_mode="tree_summarize", query_engine_method=query_method, retriever_method=retriever_method)
-        final_response = query_engine.query(question)
-        print("Final Answer:", final_response.response)
+        print_contexts_and_answer(response, query_method, retriever_method, nodes, index)
+
+def print_contexts_and_answer(response, query_method, retriever_method, nodes, index):
+    retrieved_nodes = response.source_nodes
+    chunks = [node.text for node in retrieved_nodes]
+    print("Contexts:")
+    for chunk in chunks:
+        print(chunk)
+    if retriever_method in ["BM25", "BM25+Vector"]:
+        query_engine = setup_query_engine(None, response_mode="tree_summarize", nodes=nodes, query_engine_method=query_method, retriever_method=retriever_method)
+    else:
+        query_engine = setup_query_engine(index, response_mode="tree_summarize", query_engine_method=query_method, retriever_method=retriever_method)
+    final_response = query_engine.query(question)
+    print("Final Answer:", final_response.response)
 
 def main():
     parser = argparse.ArgumentParser(description="Run the RAG app.")
@@ -307,7 +338,7 @@ def main():
     parser.add_argument('--embedding_model', type=str, default="BAAI/bge-large-en-v1.5")
     parser.add_argument('--csv_file', type=str, required=False, help='Path to the CSV file containing questions')
     parser.add_argument('--query_method', type=str, choices=['Default', 'FLARE', 'MS'], required=False, default='Default', help='Query Engine Method to use')
-    parser.add_argument('--retriever_method', type=str, choices=['Default', 'BM25', 'BM25+Vector'], required=False, default='Default', help='Retriever Method to use')
+    parser.add_argument('--retriever_method', type=str, choices=['Vector Search', 'BM25', 'BM25+Vector'], required=False, default='Vector Search', help='Retriever Method to use')
     args = parser.parse_args()
 
     if args.mode == 'terminal':
@@ -326,8 +357,8 @@ def main():
         pass
 
 if __name__ == "__main__":
-    import sys
-    #if 'streamlit' in sys.argv[0]:
-    run_streamlit_app('azure', 'gpt35')
-    #else:
-    #    main()
+    use_streamlit = True
+    if use_streamlit:
+        run_streamlit_app('azure', 'gpt35')
+    else:
+        main()
